@@ -104,6 +104,9 @@ flags.DEFINE_integer("save_checkpoints_steps", 1000,
 flags.DEFINE_integer("iterations_per_loop", 1000,
                      "How many steps to make in each estimator call.")
 
+flags.DEFINE_integer("keep_checkpoint_max", 5,
+                     "How often to save the model checkpoint.")
+
 flags.DEFINE_integer(
     "n_best_size", 20,
     "The total number of n-best predictions to generate in the "
@@ -148,6 +151,10 @@ flags.DEFINE_bool(
 flags.DEFINE_bool(
     "version_2_with_negative", False,
     "If true, the SQuAD examples contain some that do not have an answer.")
+
+flags.DEFINE_bool(
+    "debug", False,
+    "Debugging mode")
 
 flags.DEFINE_float(
     "null_score_diff_threshold", 0.0,
@@ -427,7 +434,7 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
         start_position = 0
         end_position = 0
 
-      if example_index < 20:
+      if example_index < 3 and FLAGS.debug:
         tf.logging.info("*** Example ***")
         tf.logging.info("unique_id: %s" % (unique_id))
         tf.logging.info("example_index: %s" % (example_index))
@@ -550,13 +557,17 @@ def _check_is_max_context(doc_spans, cur_span_index, position):
 def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
                  use_one_hot_embeddings):
   """Creates a classification model."""
-  model = modeling.BertModel(
+
+  with tf.variable_scope('bert', reuse=tf.AUTO_REUSE) as scope:
+    model = modeling.BertModel(
       config=bert_config,
       is_training=is_training,
       input_ids=input_ids,
       input_mask=input_mask,
       token_type_ids=segment_ids,
-      use_one_hot_embeddings=use_one_hot_embeddings)
+      use_one_hot_embeddings=use_one_hot_embeddings,
+      scope=scope
+    )
 
   final_hidden = model.get_sequence_output()
 
@@ -566,14 +577,13 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
   hidden_size = final_hidden_shape[2]
 
   output_weights = tf.get_variable(
-      "cls/squad/output_weights", [2, hidden_size],
-      initializer=tf.truncated_normal_initializer(stddev=0.02))
+    "cls/squad/output_weights", [2, hidden_size],
+    initializer=tf.truncated_normal_initializer(stddev=0.02))
 
   output_bias = tf.get_variable(
       "cls/squad/output_bias", [2], initializer=tf.zeros_initializer())
 
-  final_hidden_matrix = tf.reshape(final_hidden,
-                                   [batch_size * seq_length, hidden_size])
+  final_hidden_matrix = tf.reshape(final_hidden, [batch_size * seq_length, hidden_size])
   logits = tf.matmul(final_hidden_matrix, output_weights, transpose_b=True)
   logits = tf.nn.bias_add(logits, output_bias)
 
@@ -581,9 +591,7 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
   logits = tf.transpose(logits, [2, 0, 1])
 
   unstacked_logits = tf.unstack(logits, axis=0)
-
   (start_logits, end_logits) = (unstacked_logits[0], unstacked_logits[1])
-
   return (start_logits, end_logits)
 
 
@@ -607,12 +615,12 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
     is_training = (mode == tf.estimator.ModeKeys.TRAIN)
 
     (start_logits, end_logits) = create_model(
-        bert_config=bert_config,
-        is_training=is_training,
-        input_ids=input_ids,
-        input_mask=input_mask,
-        segment_ids=segment_ids,
-        use_one_hot_embeddings=use_one_hot_embeddings)
+            bert_config=bert_config,
+            is_training=is_training,
+            input_ids=input_ids,
+            input_mask=input_mask,
+            segment_ids=segment_ids,
+            use_one_hot_embeddings=use_one_hot_embeddings)
 
     tvars = tf.trainable_variables()
 
@@ -621,15 +629,7 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
     if init_checkpoint:
       (assignment_map, initialized_variable_names
       ) = modeling.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
-      if use_tpu:
-
-        def tpu_scaffold():
-          tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
-          return tf.train.Scaffold()
-
-        scaffold_fn = tpu_scaffold
-      else:
-        tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
+      tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
 
     tf.logging.info("**** Trainable Variables ****")
     for var in tvars:
@@ -659,22 +659,21 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
 
       total_loss = (start_loss + end_loss) / 2.0
 
-      train_op = optimization.create_optimizer(
-          total_loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu)
+      global_step = tf.train.get_or_create_global_step()
+      optimizer = optimization.create_optimizer(
+          total_loss, learning_rate, num_train_steps, num_warmup_steps, global_step)
+      optimizer = tf.contrib.estimator.TowerOptimizer(optimizer)
+      train_op = optimizer.minimize(total_loss, global_step=global_step)
 
-      output_spec = tf.contrib.tpu.TPUEstimatorSpec(
-          mode=mode,
-          loss=total_loss,
-          train_op=train_op,
-          scaffold_fn=scaffold_fn)
+      output_spec = tf.estimator.EstimatorSpec(mode=mode, loss=total_loss, train_op=train_op)
+
     elif mode == tf.estimator.ModeKeys.PREDICT:
       predictions = {
           "unique_ids": unique_ids,
           "start_logits": start_logits,
           "end_logits": end_logits,
       }
-      output_spec = tf.contrib.tpu.TPUEstimatorSpec(
-          mode=mode, predictions=predictions, scaffold_fn=scaffold_fn)
+      output_spec = tf.estimator.EstimatorSpec(mode=mode, predictions=predictions)
     else:
       raise ValueError(
           "Only TRAIN and PREDICT modes are supported: %s" % (mode))
@@ -714,7 +713,7 @@ def input_fn_builder(input_file, seq_length, is_training, drop_remainder):
 
   def input_fn(params):
     """The actual input function."""
-    batch_size = params["batch_size"]
+    batch_size = FLAGS.train_batch_size if is_training else FLAGS.predict_batch_size
 
     # For training, we want a lot of parallel reading and shuffling.
     # For eval, we want no shuffling and parallel reading doesn't matter.
@@ -1122,6 +1121,12 @@ def validate_flags_or_throw(bert_config):
         "The max_seq_length (%d) must be greater than max_query_length "
         "(%d) + 3" % (FLAGS.max_seq_length, FLAGS.max_query_length))
 
+  ngpu = len(os.getenv('CUDA_VISIBLE_DEVICES', '0').split(','))
+
+  if FLAGS.predict_batch_size % ngpu != 0 or FLAGS.train_batch_size % ngpu != 0:
+    raise ValueError(
+        "Batch size should be able to divide with number of gpu")
+
 
 def main(_):
   tf.logging.set_verbosity(tf.logging.INFO)
@@ -1135,21 +1140,10 @@ def main(_):
   tokenizer = tokenization.FullTokenizer(
       vocab_file=FLAGS.vocab_file, do_lower_case=FLAGS.do_lower_case)
 
-  tpu_cluster_resolver = None
-  if FLAGS.use_tpu and FLAGS.tpu_name:
-    tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
-        FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
-
-  is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
-  run_config = tf.contrib.tpu.RunConfig(
-      cluster=tpu_cluster_resolver,
-      master=FLAGS.master,
+  run_config = tf.estimator.RunConfig(
       model_dir=FLAGS.output_dir,
       save_checkpoints_steps=FLAGS.save_checkpoints_steps,
-      tpu_config=tf.contrib.tpu.TPUConfig(
-          iterations_per_loop=FLAGS.iterations_per_loop,
-          num_shards=FLAGS.num_tpu_cores,
-          per_host_input_for_training=is_per_host))
+      keep_checkpoint_max=FLAGS.keep_checkpoint_max)
 
   train_examples = None
   num_train_steps = None
@@ -1177,12 +1171,10 @@ def main(_):
 
   # If TPU is not available, this will fall back to normal Estimator on CPU
   # or GPU.
-  estimator = tf.contrib.tpu.TPUEstimator(
-      use_tpu=FLAGS.use_tpu,
-      model_fn=model_fn,
-      config=run_config,
-      train_batch_size=FLAGS.train_batch_size,
-      predict_batch_size=FLAGS.predict_batch_size)
+  estimator = tf.estimator.Estimator(
+      model_fn=tf.contrib.estimator.replicate_model_fn(
+          model_fn, loss_reduction=tf.losses.Reduction.MEAN),
+      config=run_config)
 
   if FLAGS.do_train:
     # We write to a temporary file to avoid storing very large constant tensors
@@ -1235,6 +1227,13 @@ def main(_):
         max_query_length=FLAGS.max_query_length,
         is_training=False,
         output_fn=append_feature)
+
+    if len(eval_features) % FLAGS.predict_batch_size != 0:
+        for i in range(len(eval_features) % FLAGS.predict_batch_size):
+            dummy = eval_features[-1]
+            dummy.unique_id = dummy.unique_id + 1
+            append_feature(dummy)
+
     eval_writer.close()
 
     tf.logging.info("***** Running predictions *****")
@@ -1277,6 +1276,7 @@ def main(_):
 
 
 if __name__ == "__main__":
+  print("Current options : ", tf.app.flags.FLAGS.flag_values_dict())
   flags.mark_flag_as_required("vocab_file")
   flags.mark_flag_as_required("bert_config_file")
   flags.mark_flag_as_required("output_dir")
